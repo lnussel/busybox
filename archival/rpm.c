@@ -23,6 +23,9 @@
 
 #include <getopt.h>
 
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+
 #define RPM_CHAR_TYPE           1
 #define RPM_INT8_TYPE           2
 #define RPM_INT16_TYPE          3
@@ -49,21 +52,27 @@
 #define TAG_ARCH                1022
 #define TAG_PREIN               1023
 #define TAG_POSTIN              1024
+#define TAG_FILESIZES           1028
+#define TAG_FILEMODES           1030
+#define TAG_FILELINKTOS         1036
 #define TAG_FILEFLAGS           1037
 #define TAG_FILEUSERNAME        1039
 #define TAG_FILEGROUPNAME       1040
 #define TAG_SOURCERPM           1044
 #define TAG_PREINPROG           1085
 #define TAG_POSTINPROG          1086
+#define TAG_FILEINODES          1096
 #define TAG_PREFIXS             1098
 #define TAG_DIRINDEXES          1116
 #define TAG_BASENAMES           1117
 #define TAG_DIRNAMES            1118
 #define TAG_PAYLOADCOMPRESSOR   1125
+#define TAG_FILENLINKS          5045
 
 
 #define RPMFILE_CONFIG          (1 << 0)
 #define RPMFILE_DOC             (1 << 1)
+#define RPMFILE_GHOST           (1 << 6)
 
 #define HEADER_DIR "/usr/lib/sysimage/rpm-headers"
 
@@ -76,6 +85,7 @@ enum rpm_functions_e {
 	rpm_query_list_doc = 32,
 	rpm_query_list_config = 64,
 	rpm_query_all = 128,
+	rpm_install_reflink = 256,
 };
 
 typedef struct {
@@ -90,6 +100,8 @@ struct globals {
 	rpm_index *mytags;
 	int tagcount;
 	unsigned mapsize;
+	const char* install_root;
+	char* header_dir;
 	IF_VARIABLE_ARCH_PAGESIZE(unsigned pagesize;)
 #define G_pagesize cached_pagesize(G.pagesize)
 } FIX_ALIASING;
@@ -296,6 +308,159 @@ static void print_all_tags(void)
 #define print_all_tags() ((void)0)
 #endif
 
+// XXX: sysconf(_SC_PAGESIZE)
+#define PAGE_SIZE 4096
+
+#define bit(x, n) (x[n>>3]&(1<<(n&7)))
+#define set_bit(x, n) (x[n>>3]|=(1<<(n&7)))
+
+typedef struct { int inode; int fi; } ifi_t;
+
+/* sort by inode. lowest file index first */
+static int compare_inodes(const void* a, const void* b)
+{
+	if (((const ifi_t*)a)->inode == ((const ifi_t*)b)->inode)
+		return ((const ifi_t*)a)->fi > ((const ifi_t*)b)->fi ? 1 : -1;
+
+	if (((const ifi_t*)a)->inode > ((const ifi_t*)b)->inode)
+		return 1;
+
+	return -1;
+}
+
+static search_inode(const void* a, const void* b)
+{
+	int key = *(int*)a;
+	const ifi_t* item = b;
+	if (key == item->inode)
+		return 0;
+	if (key > item->inode)
+		return 1;
+	return -1;
+}
+
+static void create_clone_from(const char* path, unsigned mode, int rpmfd, off_t off, size_t size)
+{
+		unsigned pad = (size & (PAGE_SIZE-1)) ? PAGE_SIZE - (size & (PAGE_SIZE-1)) : 0;
+		//printf("%s off %lu, size %u + %u = %u\n", path, off, size, pad, size+pad);
+		int fd = xopen3(path, O_WRONLY|O_CREAT|O_EXCL, mode&07777);
+		if (fd == -1)
+			bb_perror_msg_and_die("failed to open %s", path);
+		struct file_clone_range range = {
+			.src_fd = rpmfd,
+			.src_offset = off,
+			.src_length = size + pad,
+			.dest_offset = 0
+		};
+		int ret = ioctl(fd, FICLONERANGE, &range);
+		if (ret) {
+			unlink(path);
+			bb_perror_msg_and_die("can't clone into %s", path);
+		}
+		ret = ftruncate(fd, size);
+		if (ret) {
+			unlink(path);
+			bb_perror_msg_and_die("can't fix size of %s", path);
+		}
+		xclose(fd);
+}
+
+static void reflink_package(int rpmfd)
+{
+	int nfiles = rpm_getcount(TAG_BASENAMES);
+	ifi_t* inodes = xmalloc(sizeof(ifi_t) * nfiles);
+	for (int i = 0; i < nfiles; ++i) {
+		inodes[i].fi = i;
+		inodes[i].inode = rpm_getint(TAG_FILEINODES, i);
+	}
+	qsort(inodes, nfiles, sizeof(ifi_t), compare_inodes);
+	int ninodes = 0;
+	for (int i = 1; i < nfiles; ++i) {
+		if (inodes[ninodes].inode == inodes[i].inode) {
+#if 0
+			printf("skip hardlink %s%s inode %d fi %d\n",
+					rpm_getstr(TAG_DIRNAMES, rpm_getint(TAG_DIRINDEXES, inodes[i].fi)),
+					rpm_getstr(TAG_BASENAMES, inodes[i].fi), inodes[i].inode, inodes[i].fi);
+#endif
+			continue;
+		}
+
+		++ninodes;
+		inodes[ninodes].fi = inodes[i].fi;
+		inodes[ninodes].inode = inodes[i].inode;
+	}
+	++ninodes;
+
+	off_t off = xlseek(rpmfd, 0, SEEK_CUR);
+	if (off & (PAGE_SIZE-1)) {
+		off += PAGE_SIZE - (off & (PAGE_SIZE-1));
+		xlseek(rpmfd, off, SEEK_SET);
+	}
+
+	mode_t org_mask = umask(022);
+	for (int i = 0; i < nfiles; ++i) {
+		char* d = rpm_getstr(TAG_DIRNAMES, rpm_getint(TAG_DIRINDEXES, i));
+		char* n = rpm_getstr(TAG_BASENAMES, i);
+		unsigned flags = rpm_getint(TAG_FILEFLAGS, i);
+		if (flags & RPMFILE_GHOST)
+			continue;
+		unsigned mode = rpm_getint(TAG_FILEMODES, i);
+		if (S_ISDIR(mode)) {
+			char* path = xasprintf("%s%s%s", G.install_root, d, n);
+			unsigned perms = mode&07777;
+			if (getuid()) // if we're not root we need permissions
+				perms |= 0700;
+			bb_make_directory(path, perms, FILEUTILS_RECUR);
+			free(path);
+			continue;
+		}
+		if (S_ISLNK(mode)) {
+			char* target = rpm_getstr(TAG_FILELINKTOS, i);
+			char* path = xasprintf("%s%s", G.install_root, d);
+			bb_make_directory(path, 0755, FILEUTILS_RECUR);
+			free(path);
+			path = xasprintf("%s%s%s", G.install_root, d, n);
+			//printf("symlink %s -> %s\n", path, target);
+			int ret = symlink(target, path);
+			if (ret)
+				bb_perror_msg_and_die("failed symlink %s -> %s", path, target);
+			free(path);
+			continue;
+		}
+		if (!S_ISREG(mode)) {
+			printf("skip special file %s/%s\n", d, n);
+			continue;
+		}
+		char* dir = xasprintf("%s%s", G.install_root, d);
+		bb_make_directory(dir, 0755, FILEUTILS_RECUR);
+		char* path = concat_path_file(dir, n);
+		free(dir);
+		int inode = rpm_getint(TAG_FILEINODES, i);
+		ifi_t* found = bsearch(&inode, inodes, ninodes, sizeof(ifi_t), search_inode);
+		if(!found) // can not happen
+			bb_error_msg_and_die("inode %d not found\n", inode);
+		if (found->fi != i) {
+			char* od = rpm_getstr(TAG_DIRNAMES, rpm_getint(TAG_DIRINDEXES, found->fi));
+			char* on = rpm_getstr(TAG_BASENAMES, found->fi);
+			char* opath = xasprintf("%s%s%s", G.install_root, od, on);
+			//printf("%d: hardlink %s -> %s\n", i, path, opath);
+			if (link(opath, path) < 0)
+				bb_perror_msg_and_die("failed to link %s -> %s", opath, path);
+			free(path);
+			free(opath);
+			continue;
+		}
+		unsigned size = rpm_getint(TAG_FILESIZES, i);
+		create_clone_from(path, mode, rpmfd, off, size);
+		off += size;
+		if (off & (PAGE_SIZE-1))
+			off += PAGE_SIZE - (size & (PAGE_SIZE-1));
+		free(path);
+	}
+	umask(org_mask);
+	free(inodes);
+}
+
 static void extract_cpio(int fd, const char *source_rpm)
 {
 	archive_handle_t *archive_handle;
@@ -331,13 +496,13 @@ static void install_header(int rpm_fd)
 {
 	int fd;
 	off_t payloadstart;
-	char* path = xasprintf("%s/%s-%s-%s.%s.rpm", HEADER_DIR,
+	char* path = xasprintf("%s/%s-%s-%s.%s.rpm", G.header_dir,
 							rpm_getstr0(TAG_NAME), rpm_getstr0(TAG_VERSION),
 							rpm_getstr0(TAG_RELEASE), rpm_getstr0(TAG_ARCH));
 	/* hack to avoid copy */
-	path[strlen(HEADER_DIR)] = 0;
+	path[strlen(G.header_dir)] = 0;
 	bb_make_directory(path, 0755, FILEUTILS_RECUR);
-	path[strlen(HEADER_DIR)] = '/';
+	path[strlen(G.header_dir)] = '/';
 
 	payloadstart = xlseek(rpm_fd, 0, SEEK_CUR);
 	xlseek(rpm_fd, 0, SEEK_SET);
@@ -406,7 +571,7 @@ int rpm_main(int argc, char **argv)
 		{0,              0,                 0,  0 }
 	};
 
-	while ((opt = getopt_long(argc, argv, "iqpldcaU", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "iqpldcaUr:", long_options, &option_index)) != -1) {
 		switch (opt) {
 		case 0: /* ignore */
 			break;
@@ -438,6 +603,8 @@ int rpm_main(int argc, char **argv)
 			break;
 		case 'a': /* query all packages */
 			func |= rpm_query_all;
+		case 'r': /* install root */
+			G.install_root = xstrdup(optarg);
 			break;
 		default:
 			bb_show_usage();
@@ -449,8 +616,10 @@ int rpm_main(int argc, char **argv)
 		bb_show_usage();
 	}
 
+	G.header_dir = xasprintf("%s%s", G.install_root?G.install_root:"", HEADER_DIR);
+
 	if (func & rpm_query && (func | rpm_query_package) != func )
-		rpms = xopendir(HEADER_DIR);
+		rpms = xopendir(G.header_dir);
 
 	for (;;) {
 		int rpm_fd;
@@ -464,7 +633,7 @@ int rpm_main(int argc, char **argv)
 				break;
 			if (DOT_OR_DOTDOT(ent->d_name))
 				continue; /* . or .. */
-			path = concat_path_file(HEADER_DIR, ent->d_name);
+			path = concat_path_file(G.header_dir, ent->d_name);
 			rpm_fd = rpm_gettags(path);
 			free(path);
 			if (!(func & rpm_query_all) && strcmp(rpm_getstr0(TAG_NAME), *argv)) {
@@ -482,10 +651,18 @@ int rpm_main(int argc, char **argv)
 			/* -i (and not -qi) */
 
 			install_header(rpm_fd);
-			/* Backup any config files */
-			loop_through_files(TAG_BASENAMES, fileaction_dobackup);
-			/* Extact the archive */
-			extract_cpio(rpm_fd, source_rpm);
+
+			int marker;
+			xread(rpm_fd, &marker, 4);
+			if (ntohl(marker) == 12245589) {
+				reflink_package(rpm_fd);
+			} else {
+				xlseek(rpm_fd, -4, SEEK_CUR);
+				/* Backup any config files */
+				loop_through_files(TAG_BASENAMES, fileaction_dobackup);
+				/* Extact the archive */
+				extract_cpio(rpm_fd, source_rpm);
+			}
 			/* Set the correct file uid/gid's */
 			loop_through_files(TAG_BASENAMES, fileaction_setowngrp);
 		}
@@ -566,6 +743,9 @@ int rpm_main(int argc, char **argv)
 	}
 	if (rpms)
 		closedir(rpms);
+
+	free(G.install_root);
+	free(G.header_dir);
 
 	return 0;
 }
