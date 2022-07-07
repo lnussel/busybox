@@ -476,7 +476,8 @@ int rpm_main(int argc, char **argv)
 
 			if (!(func & (rpm_query_info|rpm_query_list))) {
 				/* If just a straight query, just give package name */
-				printf("%s-%s-%s\n", rpm_getstr0(TAG_NAME), rpm_getstr0(TAG_VERSION), rpm_getstr0(TAG_RELEASE));
+				printf("%s-%s-%s.%s\n", rpm_getstr0(TAG_NAME), rpm_getstr0(TAG_VERSION),
+						rpm_getstr0(TAG_RELEASE), rpm_getstr0(TAG_ARCH));
 			}
 			if (func & rpm_query_info) {
 				/* Do the nice printout */
