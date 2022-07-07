@@ -44,6 +44,7 @@
 #define TAG_PACKAGER            1015
 #define TAG_GROUP               1016
 #define TAG_URL                 1020
+#define TAG_ARCH                1022
 #define TAG_PREIN               1023
 #define TAG_POSTIN              1024
 #define TAG_FILEFLAGS           1037
@@ -62,6 +63,8 @@
 #define RPMFILE_CONFIG          (1 << 0)
 #define RPMFILE_DOC             (1 << 1)
 
+#define HEADER_DIR "/usr/lib/sysimage/rpm-headers"
+
 enum rpm_functions_e {
 	rpm_query = 1,
 	rpm_install = 2,
@@ -69,7 +72,8 @@ enum rpm_functions_e {
 	rpm_query_package = 8,
 	rpm_query_list = 16,
 	rpm_query_list_doc = 32,
-	rpm_query_list_config = 64
+	rpm_query_list_config = 64,
+	rpm_query_all = 128,
 };
 
 typedef struct {
@@ -321,17 +325,44 @@ static void extract_cpio(int fd, const char *source_rpm)
 		continue;
 }
 
+static void install_header(int rpm_fd)
+{
+	int fd;
+	off_t payloadstart;
+	char* path = xasprintf("%s/%s-%s-%s.%s.rpm", HEADER_DIR,
+							rpm_getstr0(TAG_NAME), rpm_getstr0(TAG_VERSION),
+							rpm_getstr0(TAG_RELEASE), rpm_getstr0(TAG_ARCH));
+	/* hack to avoid copy */
+	path[strlen(HEADER_DIR)] = 0;
+	bb_make_directory(path, 0755, FILEUTILS_RECUR);
+	path[strlen(HEADER_DIR)] = '/';
+
+	payloadstart = xlseek(rpm_fd, 0, SEEK_CUR);
+	xlseek(rpm_fd, 0, SEEK_SET);
+
+	fd = xopen(path, O_WRONLY|O_CREAT|O_EXCL);
+	bb_copyfd_exact_size(rpm_fd, fd, payloadstart);
+	close(fd);
+	if (payloadstart != xlseek(rpm_fd, 0, SEEK_CUR)) {
+		unlink(path);
+		bb_error_msg_and_die("failed to write header");
+	}
+}
+
 //usage:#define rpm_trivial_usage
 //usage:       "-i PACKAGE.rpm; rpm -qp[ildc] PACKAGE.rpm"
 //usage:#define rpm_full_usage "\n\n"
 //usage:       "Manipulate RPM packages\n"
 //usage:     "\nCommands:"
 //usage:     "\n	-i	Install package"
-//usage:     "\n	-qp	Query package"
-//usage:     "\n	-qpi	Show information"
-//usage:     "\n	-qpl	List contents"
-//usage:     "\n	-qpd	List documents"
-//usage:     "\n	-qpc	List config files"
+//usage:     "\n	-q	Query package"
+//usage:     "\n\nQuery Options:"
+//usage:     "\n	-p	Query package file"
+//usage:     "\n	-a	Query all installed packages"
+//usage:     "\n	-i	Show information"
+//usage:     "\n	-l	List contents"
+//usage:     "\n	-d	List documents"
+//usage:     "\n	-c	List config files"
 
 /* RPM version 4.13.0.1:
  * Unlike -q, -i seems to imply -p: -i, -ip and -pi work the same.
@@ -356,11 +387,13 @@ int rpm_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int rpm_main(int argc, char **argv)
 {
 	int opt, func = 0;
+	struct dirent *ent;
+	DIR* rpms = NULL;
 
 	INIT_G();
 	INIT_PAGESIZE(G.pagesize);
 
-	while ((opt = getopt(argc, argv, "iqpldc")) != -1) {
+	while ((opt = getopt(argc, argv, "iqpldca")) != -1) {
 		switch (opt) {
 		case 'i': /* First arg: Install mode, with q: Information */
 			if (!func) func = rpm_install;
@@ -384,21 +417,44 @@ int rpm_main(int argc, char **argv)
 			func |= rpm_query_list;
 			func |= rpm_query_list_config;
 			break;
+		case 'a': /* query all packages */
+			func |= rpm_query_all;
+			break;
 		default:
 			bb_show_usage();
 		}
 	}
 	argv += optind;
 	//argc -= optind;
-	if (!argv[0]) {
+	if (!(func & rpm_query_all) && !argv[0]) {
 		bb_show_usage();
 	}
+
+	if (func & rpm_query && (func | rpm_query_package) != func )
+		rpms = xopendir(HEADER_DIR);
 
 	for (;;) {
 		int rpm_fd;
 		const char *source_rpm;
 
-		rpm_fd = rpm_gettags(*argv);
+		/* query installed package */
+		if (func & rpm_query && (func | rpm_query_package) != func ) {
+			char* path = NULL;
+			ent = readdir(rpms);
+			if (!ent)
+				break;
+			if (DOT_OR_DOTDOT(ent->d_name))
+				continue; /* . or .. */
+			path = concat_path_file(HEADER_DIR, ent->d_name);
+			rpm_fd = rpm_gettags(path);
+			free(path);
+			if (!(func & rpm_query_all) && strcmp(rpm_getstr0(TAG_NAME), *argv)) {
+				munmap(G.map, G.mapsize);
+				free(G.mytags);
+				continue;
+			}
+		} else
+			rpm_fd = rpm_gettags(*argv);
 		print_all_tags();
 
 		source_rpm = rpm_getstr0(TAG_SOURCERPM);
@@ -406,6 +462,7 @@ int rpm_main(int argc, char **argv)
 		if (func & rpm_install) {
 			/* -i (and not -qi) */
 
+			install_header(rpm_fd);
 			/* Backup any config files */
 			loop_through_files(TAG_BASENAMES, fileaction_dobackup);
 			/* Extact the archive */
@@ -414,8 +471,8 @@ int rpm_main(int argc, char **argv)
 			loop_through_files(TAG_BASENAMES, fileaction_setowngrp);
 		}
 		else
-		if ((func & (rpm_query|rpm_query_package)) == (rpm_query|rpm_query_package)) {
-			/* -qp */
+		if (func & rpm_query) {
+			/* -q */
 
 			if (!(func & (rpm_query_info|rpm_query_list))) {
 				/* If just a straight query, just give package name */
@@ -481,12 +538,14 @@ int rpm_main(int argc, char **argv)
 			/* Unsupported (help text shows what we support) */
 			bb_show_usage();
 		}
-		if (!*++argv)
-			break;
 		munmap(G.map, G.mapsize);
 		free(G.mytags);
 		close(rpm_fd);
+		if (!(func & rpm_query_all) && !*++argv)
+			break;
 	}
+	if (rpms)
+		closedir(rpms);
 
 	return 0;
 }
