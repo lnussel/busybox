@@ -21,6 +21,8 @@
 #include "bb_archive.h"
 #include "rpm.h"
 
+#include <getopt.h>
+
 #define RPM_CHAR_TYPE           1
 #define RPM_INT8_TYPE           2
 #define RPM_INT16_TYPE          3
@@ -386,15 +388,32 @@ static void install_header(int rpm_fd)
 int rpm_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int rpm_main(int argc, char **argv)
 {
-	int opt, func = 0;
+	int opt, option_index, func = 0;
 	struct dirent *ent;
 	DIR* rpms = NULL;
 
 	INIT_G();
 	INIT_PAGESIZE(G.pagesize);
 
-	while ((opt = getopt(argc, argv, "iqpldca")) != -1) {
+	static struct option long_options[] = {
+		{"install",      no_argument,       0,  'i' },
+		{"query",        no_argument,       0,  'q' },
+		{"force",        no_argument,       0,  0 },
+		{"nodeps",       no_argument,       0,  0 },
+		{"nodigest",     no_argument,       0,  0 },
+		{"nosignature",  no_argument,       0,  0 },
+		{"root",         required_argument, 0,  'r' },
+		{0,              0,                 0,  0 }
+	};
+
+	while ((opt = getopt_long(argc, argv, "iqpldcaU", long_options, &option_index)) != -1) {
 		switch (opt) {
+		case 0: /* ignore */
+			break;
+		case 'U':
+			if (func) bb_show_usage();
+			func = rpm_install;
+			break;
 		case 'i': /* First arg: Install mode, with q: Information */
 			if (!func) func = rpm_install;
 			else func |= rpm_query_info;
