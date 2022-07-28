@@ -102,6 +102,7 @@ struct globals {
 	unsigned mapsize;
 	const char* install_root;
 	char* header_dir;
+	char* only_prefix;
 	int force : 1;
 	IF_VARIABLE_ARCH_PAGESIZE(unsigned pagesize;)
 #define G_pagesize cached_pagesize(G.pagesize)
@@ -400,12 +401,21 @@ static void reflink_package(int rpmfd)
 
 	mode_t org_mask = umask(022);
 	for (int i = 0; i < nfiles; ++i) {
+		int skip = 0;
 		char* d = rpm_getstr(TAG_DIRNAMES, rpm_getint(TAG_DIRINDEXES, i));
 		char* n = rpm_getstr(TAG_BASENAMES, i);
 		unsigned flags = rpm_getint(TAG_FILEFLAGS, i);
 		if (flags & RPMFILE_GHOST)
 			continue;
+
+		if (G.only_prefix && strncmp(d, G.only_prefix, strlen(G.only_prefix)))
+			skip = 1;
+
 		unsigned mode = rpm_getint(TAG_FILEMODES, i);
+
+		if (skip && !S_ISREG(mode))
+			continue;
+
 		if (S_ISDIR(mode)) {
 			char* path = xasprintf("%s%s%s", G.install_root, d, n);
 			unsigned perms = mode&07777;
@@ -433,7 +443,8 @@ static void reflink_package(int rpmfd)
 			continue;
 		}
 		char* dir = xasprintf("%s%s", G.install_root, d);
-		bb_make_directory(dir, 0755, FILEUTILS_RECUR);
+		if (!skip)
+			bb_make_directory(dir, 0755, FILEUTILS_RECUR);
 		char* path = concat_path_file(dir, n);
 		free(dir);
 		int inode = rpm_getint(TAG_FILEINODES, i);
@@ -441,6 +452,8 @@ static void reflink_package(int rpmfd)
 		if(!found) // can not happen
 			bb_error_msg_and_die("inode %d not found\n", inode);
 		if (found->fi != i) {
+			if (skip)
+				continue;
 			char* od = rpm_getstr(TAG_DIRNAMES, rpm_getint(TAG_DIRINDEXES, found->fi));
 			char* on = rpm_getstr(TAG_BASENAMES, found->fi);
 			char* opath = xasprintf("%s%s%s", G.install_root, od, on);
@@ -452,7 +465,8 @@ static void reflink_package(int rpmfd)
 			continue;
 		}
 		unsigned size = rpm_getint(TAG_FILESIZES, i);
-		create_clone_from(path, mode, rpmfd, off, size);
+		if (!skip)
+			create_clone_from(path, mode, rpmfd, off, size);
 		off += size;
 		if (off & (PAGE_SIZE-1))
 			off += PAGE_SIZE - (size & (PAGE_SIZE-1));
@@ -557,6 +571,7 @@ int rpm_main(int argc, char **argv)
 	int opt, option_index, func = 0;
 	struct dirent *ent;
 	DIR* rpms = NULL;
+	int justfs = 0;
 
 	INIT_G();
 	INIT_PAGESIZE(G.pagesize);
@@ -569,6 +584,8 @@ int rpm_main(int argc, char **argv)
 		{"nodigest",     no_argument,       0,  0 },
 		{"nosignature",  no_argument,       0,  0 },
 		{"root",         required_argument, 0,  'r' },
+		{"only-prefix",  required_argument, 0,  2 },
+		{"justfs",       no_argument,       0,  3 },
 		{0,              0,                 0,  0 }
 	};
 
@@ -578,6 +595,12 @@ int rpm_main(int argc, char **argv)
 			break;
 		case 1:
 			G.force = 1;
+			break;
+		case 2:
+			G.only_prefix = xstrdup(optarg);
+			break;
+		case 3:
+			justfs = 1;
 			break;
 		case 'U':
 			if (func) bb_show_usage();
@@ -654,7 +677,8 @@ int rpm_main(int argc, char **argv)
 		if (func & rpm_install) {
 			/* -i (and not -qi) */
 
-			install_header(rpm_fd);
+			if (!justfs)
+				install_header(rpm_fd);
 
 			int marker;
 			xread(rpm_fd, &marker, 4);
@@ -750,6 +774,7 @@ int rpm_main(int argc, char **argv)
 
 	free(G.install_root);
 	free(G.header_dir);
+	free(G.only_prefix);
 
 	return 0;
 }
