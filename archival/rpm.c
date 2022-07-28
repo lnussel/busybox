@@ -102,6 +102,7 @@ struct globals {
 	unsigned mapsize;
 	const char* install_root;
 	char* header_dir;
+	int force : 1;
 	IF_VARIABLE_ARCH_PAGESIZE(unsigned pagesize;)
 #define G_pagesize cached_pagesize(G.pagesize)
 } FIX_ALIASING;
@@ -343,7 +344,7 @@ static void create_clone_from(const char* path, unsigned mode, int rpmfd, off_t 
 {
 		unsigned pad = (size & (PAGE_SIZE-1)) ? PAGE_SIZE - (size & (PAGE_SIZE-1)) : 0;
 		//printf("%s off %lu, size %u + %u = %u\n", path, off, size, pad, size+pad);
-		int fd = xopen3(path, O_WRONLY|O_CREAT|O_EXCL, mode&07777);
+		int fd = xopen3(path, O_WRONLY|O_CREAT|(G.force?O_TRUNC:O_EXCL), mode&07777);
 		if (fd == -1)
 			bb_perror_msg_and_die("failed to open %s", path);
 		struct file_clone_range range = {
@@ -563,7 +564,7 @@ int rpm_main(int argc, char **argv)
 	static struct option long_options[] = {
 		{"install",      no_argument,       0,  'i' },
 		{"query",        no_argument,       0,  'q' },
-		{"force",        no_argument,       0,  0 },
+		{"force",        no_argument,       0,  1 },
 		{"nodeps",       no_argument,       0,  0 },
 		{"nodigest",     no_argument,       0,  0 },
 		{"nosignature",  no_argument,       0,  0 },
@@ -574,6 +575,9 @@ int rpm_main(int argc, char **argv)
 	while ((opt = getopt_long(argc, argv, "iqpldcaUr:", long_options, &option_index)) != -1) {
 		switch (opt) {
 		case 0: /* ignore */
+			break;
+		case 1:
+			G.force = 1;
 			break;
 		case 'U':
 			if (func) bb_show_usage();
